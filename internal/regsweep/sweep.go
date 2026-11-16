@@ -229,8 +229,8 @@ func (s *Sweeper) Run(ctx context.Context) {
 
 // Sweep lists the runner group once and acts on each confirmed leaked
 // registration. It logs one line per candidate and one summary line. When a
-// bound cuts it short, the next sweep starts after the last runner it looked
-// up.
+// bound (lookups, removals or the timeout) cuts it short, the next sweep
+// starts after the last runner it looked up.
 func (s *Sweeper) Sweep(parent context.Context) Result {
 	ctx, cancel := context.WithTimeout(parent, s.cfg.Timeout)
 	defer cancel()
@@ -247,9 +247,11 @@ func (s *Sweeper) Sweep(parent context.Context) Result {
 	defer s.mu.Unlock()
 	lookups := 0
 	var lastLookup int64
+	timedOut := false
 	for _, r := range s.rotate(runners) {
 		if ctx.Err() != nil {
 			res.Errors++
+			timedOut = true
 			break
 		}
 		if r.Status != "offline" || r.Busy || !runnerName.MatchString(r.Name) {
@@ -306,7 +308,9 @@ func (s *Sweeper) Sweep(parent context.Context) Result {
 			s.logger.Warn("Registration sweep could not remove runner; leaving it for the next sweep", slog.Int64("runnerID", r.ID), slog.String("name", r.Name), slog.Any("error", err))
 		}
 	}
-	if res.Deferred > 0 {
+	// Any bound that cut the sweep short (lookups, removals or the timeout)
+	// moves the next start past the runners this sweep looked up.
+	if res.Deferred > 0 || timedOut {
 		s.resumeAfter = lastLookup
 	} else {
 		s.resumeAfter = 0
