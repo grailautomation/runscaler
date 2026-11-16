@@ -72,10 +72,14 @@ export const tartFields = [
   field('mtu', 'number', 'Guest MTU (0 = auto, -1 = off)', 'VM MTU（0 自動，-1 停用）', { min: -1, max: 1500 }),
   field('dns', 'lines', 'Guest DNS IPs (one per line)', 'VM DNS IP（每行一個）'),
   field('net-bridged', 'text', 'Bridged host interface', '橋接的主機網路介面', { placeholder: 'en0' }),
+  field('net-softnet', 'bool', 'Softnet network isolation', 'Softnet 網路隔離', { helpEn: 'Runs tart with --net-softnet. Cannot be combined with net-bridged. Softnet admits traffic to the host gateway unless a block rule matches it.', helpZh: '以 --net-softnet 執行 tart。不可與 net-bridged 同時使用。除非封鎖規則相符，Softnet 允許連到主機閘道。' }),
+  field('net-softnet-allow', 'text', 'Softnet allow rules (comma-separated)', 'Softnet 允許規則（逗號分隔）', { placeholder: 'out proto udp @host port 53,out proto tcp @host port 53', helpEn: 'Passed to tart run --net-softnet-allow. Needs net-softnet.', helpZh: '傳給 tart run --net-softnet-allow。需要 net-softnet。' }),
+  field('net-softnet-block', 'text', 'Softnet block rules (comma-separated)', 'Softnet 封鎖規則（逗號分隔）', { placeholder: 'out @host', helpEn: 'Passed to tart run --net-softnet-block. Needs net-softnet. "out @host" keeps the guest off the host.', helpZh: '傳給 tart run --net-softnet-block。需要 net-softnet。"out @host" 使 VM 無法連到主機。' }),
   field('cache-cleanup', 'bool', 'Clean Tart OCI/IPSW cache', '清理 Tart OCI/IPSW 快取', { helpEn: 'Enabled by default; local VMs are not deleted.', helpZh: '預設啟用；不會刪除本機 VM。' }),
   field('cache-max-age', 'duration', 'Tart cache max age', 'Tart 快取最長保留時間', { placeholder: '168h' }),
   field('cache-budget', 'number', 'Tart cache budget (GB)', 'Tart 快取容量上限（GB）', { min: 0 }),
   field('cache-cleanup-interval', 'duration', 'Tart cache cleanup interval', 'Tart 快取清理間隔', { placeholder: '24h' }),
+  field('clone-min-free-gb', 'number', 'Minimum free GB before a clone', '複製 VM 前的最低可用空間（GB）', { min: 0, helpEn: 'tart clone is refused when the Tart home filesystem has less free space. 0 disables.', helpZh: 'Tart 主目錄所在檔案系統可用空間不足時拒絕 tart clone。0 為停用。' }),
 ];
 
 export const retryFields = [
