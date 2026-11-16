@@ -189,6 +189,25 @@ func (c *TartHostCoordinator) release(slot tartSlot) {
 	}
 }
 
+// softnetReservedMAC is the address Softnet keeps for its own DHCP server;
+// a guest that asks for it is refused ("VM MAC address ... is reserved for
+// the DHCP server"), and natMAC(0) is exactly that address.
+const softnetReservedMAC = "02:00:00:00:00:01"
+
+// softnetMAC is the fixed per-slot address of a Softnet guest: locally
+// administered, unicast, stable per slot (Softnet's DHCP sees the same
+// clients), and never Softnet's reserved address.
+func softnetMAC(index int) string {
+	for salt := 0; ; salt++ {
+		digest := sha256.Sum256(fmt.Appendf(nil, "runscaler-tart/softnet/%d/%d", index, salt))
+		address := net.HardwareAddr(digest[:6])
+		address[0] = address[0]&0xfe | 0x02 // locally administered, unicast
+		if s := address.String(); s != softnetReservedMAC {
+			return s
+		}
+	}
+}
+
 func natMAC(index int) string {
 	n := uint64(index) + 1
 	return net.HardwareAddr{0x02, byte(n >> 32), byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n)}.String()
@@ -575,6 +594,9 @@ func (p *TartProvider) writeVMMAC(ctx context.Context, name string, slotIdx int,
 	configPath := filepath.Join(tartHome, "vms", name, "config.json")
 
 	mac := natMAC(slotIdx)
+	if p.netSoftnet {
+		mac = softnetMAC(slotIdx)
+	}
 	if p.netBridged != "" {
 		out, err := p.cmd.Run(ctx, "/sbin/ifconfig", p.netBridged)
 		if err != nil {

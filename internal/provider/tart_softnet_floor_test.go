@@ -2,8 +2,12 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
+	"net"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -123,5 +127,53 @@ func TestStatfsFreeBytesReadsARealFilesystem(t *testing.T) {
 	free, err := statfsFreeBytes(t.TempDir())
 	if err != nil || free == 0 {
 		t.Fatalf("statfsFreeBytes(tempdir) = %d, %v; want > 0, nil", free, err)
+	}
+}
+
+func TestSoftnetMACAvoidsReservedAndIsStable(t *testing.T) {
+	seen := map[string]int{}
+	for i := 0; i < 64; i++ {
+		m := softnetMAC(i)
+		if m == softnetReservedMAC {
+			t.Fatalf("softnetMAC(%d) is Softnet's reserved DHCP address", i)
+		}
+		hw, err := net.ParseMAC(m)
+		if err != nil || len(hw) != 6 || hw[0]&1 != 0 || hw[0]&2 == 0 {
+			t.Fatalf("softnetMAC(%d) = %q is not a locally administered unicast address", i, m)
+		}
+		if j, dup := seen[m]; dup {
+			t.Fatalf("softnetMAC(%d) = softnetMAC(%d) = %q", i, j, m)
+		}
+		seen[m] = i
+		if again := softnetMAC(i); again != m {
+			t.Fatalf("softnetMAC(%d) not stable: %q then %q", i, m, again)
+		}
+	}
+	if natMAC(0) != softnetReservedMAC {
+		t.Fatalf("natMAC(0) = %q; this test guards the collision with %q", natMAC(0), softnetReservedMAC)
+	}
+}
+
+func TestTartProvider_SoftnetWritesSoftnetMAC(t *testing.T) {
+	home := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(home, "vms", "runner-abc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := newTestTartProvider(&mockCommandRunner{})
+	p.home = home
+	p.netSoftnet = true
+	if err := p.writeVMMAC(context.Background(), "runner-abc", 0, map[string]any{}); err != nil {
+		t.Fatalf("writeVMMAC: %v", err)
+	}
+	raw, err := os.ReadFile(filepath.Join(home, "vms", "runner-abc", "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg map[string]any
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg["macAddress"]; got != softnetMAC(0) || got == softnetReservedMAC {
+		t.Errorf("macAddress = %v, want softnetMAC(0) = %s", got, softnetMAC(0))
 	}
 }
