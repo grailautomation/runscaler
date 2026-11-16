@@ -24,11 +24,14 @@
 package regsweep
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -125,6 +128,13 @@ type Sweeper struct {
 	local   LocalRunners
 	logger  *slog.Logger
 	trigger chan struct{}
+
+	// resumeAfter is the runner ID after which the next sweep starts, set
+	// when a bound cut the previous sweep short. Runners that stay in the
+	// list (another scale set's, or ones whose removal GitHub refuses) would
+	// otherwise use up the bounds of every sweep and starve later ones.
+	mu          sync.Mutex
+	resumeAfter int64
 }
 
 // New returns a Sweeper. It refuses a configuration that could remove
@@ -218,7 +228,9 @@ func (s *Sweeper) Run(ctx context.Context) {
 }
 
 // Sweep lists the runner group once and acts on each confirmed leaked
-// registration. It logs one line per candidate and one summary line.
+// registration. It logs one line per candidate and one summary line. When a
+// bound cuts it short, the next sweep starts after the last runner it looked
+// up.
 func (s *Sweeper) Sweep(parent context.Context) Result {
 	ctx, cancel := context.WithTimeout(parent, s.cfg.Timeout)
 	defer cancel()
@@ -231,8 +243,11 @@ func (s *Sweeper) Sweep(parent context.Context) Result {
 		s.summary(res)
 		return res
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	lookups := 0
-	for _, r := range runners {
+	var lastLookup int64
+	for _, r := range s.rotate(runners) {
 		if ctx.Err() != nil {
 			res.Errors++
 			break
@@ -253,6 +268,7 @@ func (s *Sweeper) Sweep(parent context.Context) Result {
 			continue
 		}
 		lookups++
+		lastLookup = r.ID
 		ref, err := s.api.GetRunner(ctx, int(r.ID))
 		if isNotFound(err) {
 			res.Gone++
@@ -290,8 +306,22 @@ func (s *Sweeper) Sweep(parent context.Context) Result {
 			s.logger.Warn("Registration sweep could not remove runner; leaving it for the next sweep", slog.Int64("runnerID", r.ID), slog.String("name", r.Name), slog.Any("error", err))
 		}
 	}
+	if res.Deferred > 0 {
+		s.resumeAfter = lastLookup
+	} else {
+		s.resumeAfter = 0
+	}
 	s.summary(res)
 	return res
+}
+
+// rotate orders runners by ID, starting after resumeAfter and wrapping
+// around, so every runner is reached within a bounded number of sweeps.
+func (s *Sweeper) rotate(runners []Runner) []Runner {
+	sorted := slices.Clone(runners)
+	slices.SortFunc(sorted, func(a, b Runner) int { return cmp.Compare(a.ID, b.ID) })
+	start, _ := slices.BinarySearchFunc(sorted, s.resumeAfter+1, func(r Runner, id int64) int { return cmp.Compare(r.ID, id) })
+	return append(sorted[start:], sorted[:start]...)
 }
 
 func (s *Sweeper) summary(res Result) {

@@ -463,3 +463,66 @@ func TestAPIBaseURL(t *testing.T) {
 		}
 	}
 }
+
+// Runners of another scale set that stay in the list use up the lookups of
+// a sweep; the next sweep starts after them and reaches the leaked one.
+func TestSweepReachesLaterRunnerPastForeignLookups(t *testing.T) {
+	var runners []Runner
+	for i := range DefaultMaxLookups {
+		runners = append(runners, leaked(int64(i+1)))
+	}
+	mine := leaked(int64(DefaultMaxLookups + 1))
+	runners = append(runners, mine)
+	e := newEnv(t, ModeRemove, runners)
+	e.api.ours(mine.ID)
+	for i := range DefaultMaxLookups {
+		id := i + 1
+		e.api.refs[id] = &scaleset.RunnerReference{ID: id, RunnerScaleSetID: testScaleSetID + 1}
+	}
+	if res := e.sweeper.Sweep(context.Background()); res.Removed != 0 || res.Deferred != 1 {
+		t.Fatalf("first sweep = %+v, want the lookups used up and 1 deferred", res)
+	}
+	e.sweeper.Sweep(context.Background())
+	assertRemoved(t, e, mine.ID)
+}
+
+// Registrations whose removal GitHub keeps refusing use up the removal bound
+// of a sweep; the next sweep starts after them and reaches the removable one.
+func TestSweepReachesLaterRunnerPastRefusedRemovals(t *testing.T) {
+	var runners []Runner
+	e := newEnv(t, ModeRemove)
+	e.api.removeErr = map[int64]error{}
+	for i := range DefaultMaxRemovals {
+		id := int64(i + 1)
+		runners = append(runners, leaked(id))
+		e.api.ours(id)
+		e.api.removeErr[id] = fmt.Errorf("request DELETE failed: %w", scaleset.JobStillRunningError)
+	}
+	removable := leaked(int64(DefaultMaxRemovals + 1))
+	runners = append(runners, removable)
+	e.api.ours(removable.ID)
+	e.gh.pages = [][]Runner{runners}
+	for sweep := 1; sweep <= 3; sweep++ {
+		e.sweeper.Sweep(context.Background())
+	}
+	assertRemoved(t, e, removable.ID)
+}
+
+// The list order from GitHub does not decide which runners a bounded sweep
+// reaches first: runners are taken by ID.
+func TestSweepTakesRunnersInIDOrder(t *testing.T) {
+	var runners []Runner
+	for i := 25; i >= 1; i-- {
+		runners = append(runners, leaked(int64(i)))
+	}
+	e := newEnv(t, ModeRemove, runners)
+	for i := range 25 {
+		e.api.ours(int64(i + 1))
+	}
+	e.sweeper.Sweep(context.Background())
+	var want []int64
+	for i := range DefaultMaxRemovals {
+		want = append(want, int64(i+1))
+	}
+	assertRemoved(t, e, want...)
+}
