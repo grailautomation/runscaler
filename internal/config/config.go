@@ -404,6 +404,18 @@ type TartConfig struct {
 	// hand out a lease, leaving the guest on a 169.254.x.x address with no
 	// route out. Empty (default) keeps NAT.
 	NetBridged string `mapstructure:"net-bridged"`
+	// NetSoftnet boots each VM with `tart run --net-softnet`: Tart's Softnet
+	// isolation, which keeps the guest off the host, the other VMs and the
+	// host's private networks while it still reaches the internet. Softnet
+	// must be on PATH and setuid root (see Tart's docs). It cannot be
+	// combined with NetBridged. false (default) keeps NAT.
+	NetSoftnet bool `mapstructure:"net-softnet"`
+	// CloneMinFreeGB refuses to clone a new VM while the filesystem that
+	// holds TART_HOME has fewer than this many GiB free. The refusal is a
+	// failed start (the job stays queued), and a free-space read that fails
+	// also refuses. Unlike [disk], which only reclaims and then starts the
+	// runner anyway, this is a hard floor. 0 (default) = no floor.
+	CloneMinFreeGB int `mapstructure:"clone-min-free-gb"`
 
 	// CacheCleanup enables periodic `tart prune` of the OCI/IPSW caches under
 	// TART_HOME. Pointer: nil = inherit default (true). Local VMs are never
@@ -642,6 +654,12 @@ func (ss *ScaleSetConfig) ValidationErrors() []error {
 		}
 		if b := ss.Tart.NetBridged; b != "" && (strings.HasPrefix(b, "-") || strings.ContainsAny(b, " \t\n=")) {
 			add(fmt.Errorf("tart net-bridged %q is not a host interface name", b))
+		}
+		if ss.Tart.NetSoftnet && ss.Tart.NetBridged != "" {
+			add(fmt.Errorf("tart net-softnet and net-bridged cannot both be set"))
+		}
+		if ss.Tart.CloneMinFreeGB < 0 {
+			add(fmt.Errorf("tart clone-min-free-gb must be >= 0"))
 		}
 	default:
 		add(fmt.Errorf("unsupported provider %q (must be %q or \"tart\")", ss.Provider, DefaultProvider))

@@ -201,7 +201,8 @@ func natMAC(index int) string {
 //  2. tart set <name> --cpu/--memory      — configure VM resources (if specified)
 //  3. Set deterministic MAC address       — prevent DHCP lease exhaustion
 //  4. tart run <name> --no-graphics       — boot VM in background goroutine
-//     (--net-bridged=<interface> when configured)
+//     (--net-bridged=<interface> or --net-softnet when configured;
+//     the clone in step 1 is refused below clone-min-free-gb)
 //  5. tart exec <name> true               — poll until Guest Agent is ready
 //  6. tart exec <name> ... run.sh         — start runner with JIT config
 //  7. tart stop + tart delete on removal
@@ -223,10 +224,17 @@ type TartProvider struct {
 	coordinator *TartHostCoordinator
 	retryConfig config.RetryConfig
 
+	// cloneMinFree refuses a clone below this many free bytes on the
+	// filesystem of TART_HOME (0 = no floor). freeBytes reads that value;
+	// nil means statfs (tests inject a fake).
+	cloneMinFree uint64
+	freeBytes    func(path string) (uint64, error)
+
 	// Guest network, applied before each runner starts (see TartConfig).
 	mtu        int      // 0 = auto, -1 = off, otherwise a fixed MTU
 	dns        []string // guest resolvers; empty = keep what Tart's NAT hands out
 	netBridged string   // host interface to bridge VMs to; empty = Tart's NAT
+	netSoftnet bool     // boot with --net-softnet (Softnet isolation)
 	githubHost string   // the host whose route decides the auto MTU
 	mtuLogMu   sync.Mutex
 	lastMTULog string // last MTU and reason logged at Info; repeats go to Debug
@@ -268,6 +276,7 @@ func NewTartProviderWithCoordinator(ss config.ScaleSetConfig, logger *slog.Logge
 		mtu:         ss.Tart.MTU,
 		dns:         ss.Tart.DNS,
 		netBridged:  ss.Tart.NetBridged,
+		netSoftnet:  ss.Tart.NetSoftnet,
 		githubHost:  registrationHost(ss.RegistrationURL),
 	}
 	if p.runnerDir == "" {
@@ -276,6 +285,7 @@ func NewTartProviderWithCoordinator(ss config.ScaleSetConfig, logger *slog.Logge
 			p.runnerDir = config.DefaultTartLinuxRunnerDir
 		}
 	}
+	p.cloneMinFree = uint64(ss.Tart.CloneMinFreeGB) << 30
 	if guest == TartGuestLinux {
 		p.vmSlots = make(chan struct{}, max(1, ss.MaxRunners+ss.Tart.PoolSize))
 	}
@@ -288,7 +298,39 @@ func (p *TartProvider) runArgs(name string) []string {
 	if p.netBridged != "" {
 		args = append(args, "--net-bridged="+p.netBridged)
 	}
+	if p.netSoftnet {
+		args = append(args, "--net-softnet")
+	}
 	return args
+}
+
+// checkCloneFloor returns an error when the filesystem holding TART_HOME
+// has less free space than the clone floor, or when free space cannot be
+// read (fail closed). It is a no-op without a floor.
+func (p *TartProvider) checkCloneFloor() error {
+	if p.cloneMinFree == 0 {
+		return nil
+	}
+	dir := p.home
+	if dir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("clone floor: cannot resolve TART_HOME: %w", err)
+		}
+		dir = filepath.Join(home, ".tart")
+	}
+	read := p.freeBytes
+	if read == nil {
+		read = statfsFreeBytes
+	}
+	free, err := read(dir)
+	if err != nil {
+		return fmt.Errorf("clone floor: cannot read free space of %s: %w", dir, err)
+	}
+	if free < p.cloneMinFree {
+		return fmt.Errorf("clone floor: %s has %d bytes free, below the floor of %d bytes; refusing to clone", dir, free, p.cloneMinFree)
+	}
+	return nil
 }
 
 // StartPool begins pre-warming VMs in the background.
@@ -423,7 +465,12 @@ func (p *TartProvider) bootVM(ctx context.Context, name string) (*warmVM, error)
 		_, _ = p.cmd.Run(cleanCtx, "tart", "delete", name)
 	}
 
-	// 1. Clone base image (APFS copy-on-write, near-instant)
+	// 1. Clone base image (APFS copy-on-write, near-instant), unless the
+	// disk is below the clone floor.
+	if err := p.checkCloneFloor(); err != nil {
+		releaseSlot()
+		return nil, err
+	}
 	if _, err := p.cmd.Run(ctx, "tart", "clone", p.baseImage, name); err != nil {
 		releaseSlot()
 		return nil, fmt.Errorf("failed to clone VM: %w", err)

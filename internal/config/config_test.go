@@ -917,3 +917,34 @@ func TestActionsCacheURLValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestTartNetSoftnetAndCloneFloorValidation(t *testing.T) {
+	base := func() ScaleSetConfig {
+		return ScaleSetConfig{Provider: "tart", MaxRunners: 1}
+	}
+	has := func(problems []error, sub string) bool {
+		for _, p := range problems {
+			if strings.Contains(p.Error(), sub) {
+				return true
+			}
+		}
+		return false
+	}
+	ss := base()
+	ss.Tart.NetSoftnet = true
+	ss.Tart.NetBridged = "en0"
+	if !has(ss.ValidationErrors(), "net-softnet and net-bridged") {
+		t.Error("net-softnet with net-bridged was accepted")
+	}
+	ss = base()
+	ss.Tart.CloneMinFreeGB = -1
+	if !has(ss.ValidationErrors(), "clone-min-free-gb") {
+		t.Error("negative clone-min-free-gb was accepted")
+	}
+	ss = base()
+	ss.Tart.NetSoftnet = true
+	ss.Tart.CloneMinFreeGB = 170
+	if has(ss.ValidationErrors(), "net-softnet") || has(ss.ValidationErrors(), "clone-min-free-gb") {
+		t.Errorf("valid softnet and floor settings refused: %v", ss.ValidationErrors())
+	}
+}
