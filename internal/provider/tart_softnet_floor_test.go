@@ -44,8 +44,8 @@ func TestNewTartProvider_CloneMinFreeGB(t *testing.T) {
 		Tart:        config.TartConfig{CloneMinFreeGB: 170},
 	}
 	p := NewTartProviderWithCoordinator(ss, slog.New(slog.DiscardHandler), NewTartHostCoordinator(2), TartGuestMacOS)
-	if want := uint64(170) << 30; p.cloneMinFree != want {
-		t.Errorf("cloneMinFree = %d, want %d", p.cloneMinFree, want)
+	if want := uint64(170) << 30; p.cloneFloor.MinFreeBytes != want {
+		t.Errorf("cloneFloor.MinFreeBytes = %d, want %d", p.cloneFloor.MinFreeBytes, want)
 	}
 }
 
@@ -80,12 +80,11 @@ func TestTartProvider_CloneFloor(t *testing.T) {
 			}}
 			p := newTestTartProvider(cmd)
 			p.home = "/Volumes/VMs/tart"
-			p.cloneMinFree = floor
 			var readPath string
-			p.freeBytes = func(path string) (uint64, error) {
+			p.cloneFloor = CloneFloor{MinFreeBytes: floor, FreeBytes: func(path string) (uint64, error) {
 				readPath = path
 				return tc.free, tc.readErr
-			}
+			}}
 			_, err := p.StartInstance(context.Background(), "runner-abc", "jit")
 			if readPath != "/Volumes/VMs/tart" {
 				t.Errorf("free space read on %q, want TART_HOME", readPath)
@@ -114,10 +113,10 @@ func TestTartProvider_CloneFloor(t *testing.T) {
 func TestTartProvider_NoFloorNeverReadsDisk(t *testing.T) {
 	cmd := &mockCommandRunner{results: map[string]cmdResult{"tart clone": {}, "tart run": {}, "tart exec": {}}}
 	p := newTestTartProvider(cmd)
-	p.freeBytes = func(string) (uint64, error) {
+	p.cloneFloor = CloneFloor{FreeBytes: func(string) (uint64, error) {
 		t.Fatal("free space read with no floor set")
 		return 0, nil
-	}
+	}}
 	if _, err := p.StartInstance(context.Background(), "runner-abc", "jit"); err != nil {
 		t.Fatalf("StartInstance() error: %v", err)
 	}
@@ -175,5 +174,78 @@ func TestTartProvider_SoftnetWritesSoftnetMAC(t *testing.T) {
 	}
 	if got := cfg["macAddress"]; got != softnetMAC(0) || got == softnetReservedMAC {
 		t.Errorf("macAddress = %v, want softnetMAC(0) = %s", got, softnetMAC(0))
+	}
+}
+
+func TestNewTartProvider_SoftnetRulesReachTartRun(t *testing.T) {
+	ss := config.ScaleSetConfig{
+		RunnerImage: "macos-base:latest",
+		MaxRunners:  1,
+		Tart: config.TartConfig{
+			RunnerDir:       "/Users/admin/actions-runner",
+			NetSoftnet:      true,
+			NetSoftnetAllow: "out proto udp @host port 53,out proto tcp @host port 53",
+			NetSoftnetBlock: "out @host",
+		},
+	}
+	p := NewTartProviderWithCoordinator(ss, slog.New(slog.DiscardHandler), NewTartHostCoordinator(2), TartGuestMacOS)
+	want := []string{"run", "runner-abc", "--no-graphics", "--net-softnet",
+		"--net-softnet-allow=out proto udp @host port 53,out proto tcp @host port 53",
+		"--net-softnet-block=out @host"}
+	if got := p.runArgs("runner-abc"); !slices.Equal(got, want) {
+		t.Errorf("runArgs = %q, want %q", got, want)
+	}
+}
+
+// With [tart].home empty, tart clone writes under $TART_HOME, so the floor
+// must read that filesystem, not $HOME/.tart.
+func TestCloneFloor_ReadsTartHomeEnvWhenHomeUnset(t *testing.T) {
+	envHome := t.TempDir()
+	t.Setenv("TART_HOME", envHome)
+	const floor = uint64(170) << 30
+	free := map[string]uint64{envHome: 0}
+	if userHome, err := os.UserHomeDir(); err == nil {
+		free[filepath.Join(userHome, ".tart")] = floor * 2
+	}
+	var readPath string
+	f := CloneFloor{MinFreeBytes: floor, FreeBytes: func(path string) (uint64, error) {
+		readPath = path
+		v, ok := free[path]
+		if !ok {
+			return 0, errors.New("unexpected path")
+		}
+		return v, nil
+	}}
+	err := f.Check("")
+	if readPath != envHome {
+		t.Errorf("floor read %q, want $TART_HOME %q", readPath, envHome)
+	}
+	if !errors.Is(err, ErrBelowCloneFloor) {
+		t.Fatalf("Check() = %v, want a refusal (TART_HOME volume has 0 bytes free)", err)
+	}
+
+	cmd := &mockCommandRunner{results: map[string]cmdResult{"tart clone": {}, "tart run": {}, "tart exec": {}}}
+	p := newTestTartProvider(cmd)
+	p.home = ""
+	p.cloneFloor = f
+	if _, err := p.StartInstance(context.Background(), "runner-abc", "jit"); !errors.Is(err, ErrBelowCloneFloor) {
+		t.Fatalf("StartInstance() = %v, want a floor refusal", err)
+	}
+	if n := cloneCalls(cmd); n != 0 {
+		t.Errorf("%d clone calls below the floor, want 0", n)
+	}
+}
+
+// The startup guest inspection clones too; it must pass the same floor.
+func TestDetectTartGuest_RefusesBelowCloneFloor(t *testing.T) {
+	home := t.TempDir()
+	cmd := &mockCommandRunner{results: map[string]cmdResult{"tart clone": {}, "tart delete": {}}}
+	floor := CloneFloor{MinFreeBytes: 1 << 30, FreeBytes: func(string) (uint64, error) { return 0, nil }}
+	_, err := DetectTartGuest(context.Background(), cmd, home, "example/image:latest", floor)
+	if !errors.Is(err, ErrBelowCloneFloor) {
+		t.Fatalf("DetectTartGuest() = %v, want a floor refusal", err)
+	}
+	if n := cloneCalls(cmd); n != 0 {
+		t.Errorf("%d clone calls below the floor, want 0", n)
 	}
 }
